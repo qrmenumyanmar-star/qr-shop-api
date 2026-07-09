@@ -5,7 +5,7 @@ import {
   getAppProductDomain,
   getImageUrl,
 } from "../utils/product-filters.js";
-import { resolveProductRibbonFast } from "../utils/product-ribbon.js";
+import { resolveProductRibbonFast, resolveProductRibbons } from "../utils/product-ribbon.js";
 
 function getOdooBaseUrl() {
   return String(process.env.ODOO_URL || "").trim().replace(/\/$/, "");
