@@ -284,22 +284,7 @@ export async function resolveProductRibbonFast(odooCall, product) {
   return ribbon || null;
 }
 
-export async function resolveProductRibbons(odooCall, products) {
-  if (!products.length) {
-    return [];
-  }
-
-  const priceValsMap = await buildPriceValsMap(odooCall, products);
-  const odooRibbons = await resolveRibbonsViaOdoo(
-    odooCall,
-    products,
-    priceValsMap
-  );
-
-  if (odooRibbons) {
-    return odooRibbons;
-  }
-
+async function resolveProductRibbonsLocally(odooCall, products, priceValsMap) {
   const [autoRibbons, variantMap] = await Promise.all([
     getAutoAssignRibbons(odooCall),
     loadVariantMap(odooCall, products),
@@ -328,4 +313,36 @@ export async function resolveProductRibbons(odooCall, products) {
       priceValsMap[product.id] || buildFallbackPriceVals(product)
     );
   });
+}
+
+// Catalog list endpoints: batch Odoo reads only (no per-product _get_ribbon RPC).
+export async function resolveProductRibbonsForList(odooCall, products) {
+  if (!products.length) {
+    return [];
+  }
+
+  const priceValsMap = Object.fromEntries(
+    products.map((product) => [product.id, buildFallbackPriceVals(product)])
+  );
+
+  return resolveProductRibbonsLocally(odooCall, products, priceValsMap);
+}
+
+export async function resolveProductRibbons(odooCall, products) {
+  if (!products.length) {
+    return [];
+  }
+
+  const priceValsMap = await buildPriceValsMap(odooCall, products);
+  const odooRibbons = await resolveRibbonsViaOdoo(
+    odooCall,
+    products,
+    priceValsMap
+  );
+
+  if (odooRibbons) {
+    return odooRibbons;
+  }
+
+  return resolveProductRibbonsLocally(odooCall, products, priceValsMap);
 }

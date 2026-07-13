@@ -2,10 +2,19 @@ import { success, error } from "../utils/response.js";
 import { odooCall } from "../services/odoo.service.js";
 import {
   APP_PRODUCT_FIELDS,
+  APP_PRODUCT_LIST_FIELDS,
   getAppProductDomain,
   getImageUrl,
 } from "../utils/product-filters.js";
-import { resolveProductRibbonFast, resolveProductRibbons } from "../utils/product-ribbon.js";
+import {
+  resolveProductRibbonFast,
+  resolveProductRibbons,
+  resolveProductRibbonsForList,
+} from "../utils/product-ribbon.js";
+
+let categoriesCache = null;
+let categoriesCacheTime = 0;
+const CATEGORIES_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function getOdooBaseUrl() {
   return String(process.env.ODOO_URL || "").trim().replace(/\/$/, "");
@@ -23,6 +32,9 @@ function formatProduct(product, ribbon = null) {
     description_ecommerce: product.description_ecommerce || "",
     website_description: product.website_description || "",
     categ_id: product.categ_id || false,
+    public_categ_ids: Array.isArray(product.public_categ_ids)
+      ? product.public_categ_ids
+      : [],
     uom_id: product.uom_id || false,
     product_variant_id: product.product_variant_id || false,
     write_date: writeDate,
@@ -31,8 +43,10 @@ function formatProduct(product, ribbon = null) {
   };
 }
 
-async function formatProducts(products) {
-  const ribbons = await resolveProductRibbons(odooCall, products);
+async function formatProducts(products, { fastRibbons = false } = {}) {
+  const ribbons = fastRibbons
+    ? await resolveProductRibbonsForList(odooCall, products)
+    : await resolveProductRibbons(odooCall, products);
 
   return products.map((product, index) => formatProduct(product, ribbons[index]));
 }
@@ -121,14 +135,14 @@ export async function getProducts(req, res) {
 
     const products = await odooCall("product.template", "search_read", {
       domain,
-      fields: APP_PRODUCT_FIELDS,
+      fields: APP_PRODUCT_LIST_FIELDS,
       limit,
       offset,
       order: "name asc",
     });
 
     return success(res, {
-      products: await formatProducts(products),
+      products: await formatProducts(products, { fastRibbons: true }),
       limit,
       offset,
       count: products.length,
@@ -217,13 +231,13 @@ export async function searchProducts(req, res) {
 
     const products = await odooCall("product.template", "search_read", {
       domain,
-      fields: APP_PRODUCT_FIELDS,
+      fields: APP_PRODUCT_LIST_FIELDS,
       limit: 30,
       order: "name asc",
     });
 
     return success(res, {
-      products: await formatProducts(products),
+      products: await formatProducts(products, { fastRibbons: true }),
       count: products.length,
     });
   } catch (err) {
@@ -238,35 +252,88 @@ const EXCLUDED_CATEGORY_NAMES = new Set([
   "Services",
 ]);
 
-export async function getCategories(req, res) {
+async function loadCategoriesFromOdoo() {
+  // Prefer a cheap aggregation over scanning thousands of product rows.
+  let categoryIds = [];
+
   try {
+    const grouped = await odooCall("product.template", "read_group", {
+      args: [getAppProductDomain(), ["public_categ_ids"], ["public_categ_ids"]],
+      kwargs: { lazy: false },
+    });
+
+    categoryIds = [
+      ...new Set(
+        (grouped || [])
+          .map((row) => {
+            const value = row.public_categ_ids;
+            if (Array.isArray(value)) return value[0];
+            if (typeof value === "number") return value;
+            return null;
+          })
+          .filter((id) => typeof id === "number" && id > 0)
+      ),
+    ];
+  } catch (err) {
+    console.log("CATEGORIES: read_group failed, falling back:", err.message);
+  }
+
+  if (!categoryIds.length) {
     const products = await odooCall("product.template", "search_read", {
       domain: getAppProductDomain(),
       fields: ["public_categ_ids"],
-      limit: 1000,
+      limit: 800,
     });
 
-    const categoryIds = [
+    categoryIds = [
       ...new Set(products.flatMap((product) => product.public_categ_ids || [])),
     ];
+  }
 
-    if (!categoryIds.length) {
+  if (!categoryIds.length) {
+    return [];
+  }
+
+  const categories = await odooCall("product.public.category", "search_read", {
+    domain: [["id", "in", categoryIds]],
+    fields: ["id", "name", "parent_id"],
+    order: "name asc",
+    limit: 500,
+  });
+
+  const filtered = categories.filter(
+    (category) => !EXCLUDED_CATEGORY_NAMES.has(category.name)
+  );
+
+  return filtered.sort((a, b) => {
+    const aParent = Array.isArray(a.parent_id) ? a.parent_id[0] || 0 : 0;
+    const bParent = Array.isArray(b.parent_id) ? b.parent_id[0] || 0 : 0;
+
+    if (!aParent && bParent) return -1;
+    if (aParent && !bParent) return 1;
+    if (aParent !== bParent) return aParent - bParent;
+
+    return String(a.name || "").localeCompare(String(b.name || ""));
+  });
+}
+
+export async function getCategories(req, res) {
+  try {
+    if (
+      categoriesCache &&
+      Date.now() - categoriesCacheTime < CATEGORIES_CACHE_TTL_MS
+    ) {
       return success(res, {
-        categories: [],
-        count: 0,
+        categories: categoriesCache,
+        count: categoriesCache.length,
+        cached: true,
       });
     }
 
-    const categories = await odooCall("product.public.category", "search_read", {
-      domain: [["id", "in", categoryIds]],
-      fields: ["id", "name", "parent_id"],
-      order: "name asc",
-      limit: 200,
-    });
+    const filteredCategories = await loadCategoriesFromOdoo();
 
-    const filteredCategories = categories.filter(
-      (category) => !EXCLUDED_CATEGORY_NAMES.has(category.name)
-    );
+    categoriesCache = filteredCategories;
+    categoriesCacheTime = Date.now();
 
     return success(res, {
       categories: filteredCategories,
